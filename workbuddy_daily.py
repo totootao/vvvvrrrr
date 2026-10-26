@@ -98,6 +98,50 @@
 import sys, os, json, time, uuid, base64, glob, hashlib, glob as _glob, shutil, subprocess, threading, queue
 import requests
 
+def safe_json(r, default=None):
+    """安全解析响应 JSON。
+
+    网关异常（502/504/超时）返回的是 HTML 错误页或空 body，r.json() 会抛
+    JSONDecodeError。2026-10-23 起定时运行连续失败，就是 run_account 里
+    裸 .json() 撞上这种响应、异常一路上抛把整个工作流炸掉（exit 1），
+    后续账号的签到/任务全部被跳过。所有解析都必须走这里。
+
+    ⚠️ 定义位置：必须在任何模块级调用（_bootstrap_store/load_accounts →
+    auto_refresh → refresh_one）之前，否则导入期就是 NameError。
+    """
+    try:
+        return r.json()
+    except Exception:
+        return default
+
+
+def get_json(s, url, timeout=25, retries=3, default=None):
+    """带重试的安全 GET：网络/5xx 由 api_retry 兜底，非 JSON 响应重试后返回 default。
+
+    返回 None/default 而不抛异常——查询类接口拿不到数据时可以降级
+    （日志记 ?），但不能让整个工作流陪葬。
+    """
+    r = None
+    for attempt in range(max(1, retries)):
+        try:
+            r = api_retry(s, "get", url, timeout=timeout)
+        except Exception:
+            r = None
+        if r is not None:
+            d = safe_json(r, None)
+            if d is not None:
+                return d
+            # 拿到响应但解析不出 JSON：2xx 说明是网关错误页，值得退避重试；
+            # 4xx/5xx（api_retry 已内部重试过）直接放弃返回 default
+            if r.status_code >= 400:
+                break
+        if attempt < retries - 1:
+            time.sleep(3 + attempt * 3)
+    return default
+
+
+
+
 
 class TransientError(RuntimeError):
     """网络/5xx 可重试错误。"""
@@ -289,11 +333,15 @@ def refresh_one(rt):
     r = s.post(REFRESH_URL, json={}, timeout=20, verify=False,
                headers={"X-Refresh-Token": rt, "X-Auth-Refresh-Source": "plugin",
                         "Content-Type": "application/json"})
-    d = r.json()
+    d = safe_json(r, None)
+    if not isinstance(d, dict):
+        # 网关错误页/空 body：旧代码在这里直接抛 JSONDecodeError，
+        # 被 auto_refresh 的 except 吞成"续期失败: err"，真实原因不可见
+        return None, "刷新接口返回非 JSON（HTTP %s）" % r.status_code
     inner = d.get("data") or {}
     if d.get("code") == 0 and inner.get("accessToken"):
         return inner["accessToken"], inner.get("refreshToken") or rt
-    return None, str(d.get("msg", ""))[:120]
+    return None, (str(d.get("msg", ""))[:120] or ("HTTP %s" % r.status_code))
 
 
 def refresh_all(verbose=True):
@@ -412,10 +460,18 @@ def auto_refresh():
     print("🔑 检查到 %d 个账号需要续期..." % len(due))
     updated = {}
     for user, ent in due.items():
-        try:
-            at, nrt = refresh_one(ent.get("refresh_token", ""))
-        except Exception:
-            at, nrt = None, "err"
+        at, nrt = None, None
+        # 瞬时网关错误（HTML 错误页/连接重置）重试一次；真实原因保留在 nrt 里，
+        # 不再像旧代码那样吞成 "err"——续期失败看不见原因，RT 过期后就只能人工重置
+        for attempt in (1, 2):
+            try:
+                at, nrt = refresh_one(ent.get("refresh_token", ""))
+            except Exception as e:
+                at, nrt = None, "%s: %s" % (type(e).__name__, str(e)[:60])
+            if at:
+                break
+            if attempt == 1:
+                time.sleep(3)
         if at:
             store[user] = {"refresh_token": nrt, "access_token": at,
                            "updated": time.strftime("%Y-%m-%d %H:%M")}
@@ -484,13 +540,14 @@ def new_api(tok):
 
 def api_retry(s, method, url, body=None, retries=3, gap=1.0, **kw):
     """带指数退避重试的 API 请求：网络错误/5xx 自动重试，4xx 不重试。"""
+    kw.setdefault("timeout", 25)   # 允许调用方覆盖超时，缺省 25s
     last_err = None
     for i in range(1, retries + 1):
         try:
             if method == "GET":
-                r = s.get(url, timeout=25, verify=False, **kw)
+                r = s.get(url, verify=False, **kw)
             else:
-                r = s.post(url, json=body, timeout=25, verify=False, **kw)
+                r = s.post(url, json=body, verify=False, **kw)
             if 500 <= r.status_code < 600 and i < retries:
                 last_err = RuntimeError("http %s" % r.status_code)
                 time.sleep(gap * i)
@@ -675,15 +732,31 @@ def queryUsage(s):
 
 # ---------- 各任务配方（全部经过实测） ----------
 def t_sign(s, uid, nick, log):
-    r = s.post(BASE + "/v2/billing/meter/daily-checkin", json={}, timeout=20, verify=False)
+    """每日签到。返回 "claimed" / "already" / "failed"。
+
+    旧代码对任何非 code∈(0,200) 的响应都打 ✅——业务错误（如企业账号被拒）
+    和网关 HTML 错误页会被汇报成签到成功，连签断了都看不出异常。现在只有
+    真实成功与明确的"已签"语义才打 ✅，其余打 ❌ 并把状态返回给汇总。
+    """
     try:
-        d = r.json()
-        if d.get("code") in (0, 200):
-            log("   ✅签到成功 +%s积分 连签%s天" % (d.get("data", {}).get("credit", "?"), d.get("data", {}).get("streak_days", "?")))
-        else:
-            log("   ✅签到: %s" % (d.get("msg", "")[:40] or "已签到"))
-    except Exception:
-        log("   签到请求失败")
+        r = s.post(BASE + "/v2/billing/meter/daily-checkin", json={}, timeout=20, verify=False)
+    except Exception as e:
+        log("   ❌签到请求失败: %s" % str(e)[:60])
+        return "failed"
+    d = safe_json(r, None)
+    if not isinstance(d, dict):
+        log("   ❌签到失败: 接口返回非 JSON（HTTP %s）" % r.status_code)
+        return "failed"
+    data = d.get("data") or {}
+    if d.get("code") in (0, 200) or data.get("credit") is not None:
+        log("   ✅签到成功 +%s积分 连签%s天" % (data.get("credit", "?"), data.get("streak_days", "?")))
+        return "claimed"
+    msg = str(d.get("msg", "") or "")
+    if "已签" in msg:
+        log("   ✅签到: %s" % msg[:40])
+        return "already"
+    log("   ❌签到失败: %s（HTTP %s）" % (msg[:40] or "未知错误", r.status_code))
+    return "failed"
 
 
 def t_accept_all(s, uid, nick, log):
@@ -693,8 +766,8 @@ def t_accept_all(s, uid, nick, log):
         {"code":0, "data":{"results":[{"task_code":..,"status":"accepted"|"error","message":..}]}}
     顶层 code=0 只代表请求送达，不代表每项都登记成功（实测存在整体 error 的形态）。
     """
-    r = s.get(BASE + "/v2/activity/growth/tasks", timeout=25, verify=False).json()
-    todo = [t.get("task_code") for t in r.get("data", {}).get("tasks", [])
+    r = get_json(s, BASE + "/v2/activity/growth/tasks", timeout=25) or {}
+    todo = [t.get("task_code") for t in (r.get("data") or {}).get("tasks", [])
             if isinstance(t, dict) and t.get("accept_status") == "not_accepted"]
     if not todo:
         return
@@ -2270,18 +2343,18 @@ def run_account(idx, acc, do_desktop):
     # 查询
     credits, paid = queryCredits(s)
     usage = queryUsage(s)
-    prof = s.get(BASE + "/v2/activity/growth/profile", timeout=25, verify=False).json().get("data", {})
-    energy = s.get(BASE + "/v2/activity/growth/energy", timeout=25, verify=False).json().get("data", {}).get("balance")
-    streak = s.get(BASE + "/v2/activity/growth/streak", timeout=25, verify=False).json().get("data", {}).get("streak", {})
+    prof = (get_json(s, BASE + "/v2/activity/growth/profile", timeout=25) or {}).get("data", {})
+    energy = (get_json(s, BASE + "/v2/activity/growth/energy", timeout=25) or {}).get("data", {}).get("balance")
+    streak = (get_json(s, BASE + "/v2/activity/growth/streak", timeout=25) or {}).get("data", {}).get("streak", {})
     summary["credits"] = credits
     summary["usage"] = usage
     summary["streak"] = streak.get("days", "?")
-    summary["signed"] = "✅" if "已签到" in (credits + "") or True else "❌"
+    summary["signed"] = "?"
     log("💰 积分: %s" % credits)
     log("📊 用量: %s" % usage)
     try:
-        hm = s.get(BASE + "/v2/activity/growth/heatmap", timeout=20, verify=False).json()
-        cells = hm.get("data", {}).get("cells", [])
+        hm = get_json(s, BASE + "/v2/activity/growth/heatmap", timeout=20) or {}
+        cells = (hm.get("data") or {}).get("cells", [])
         signed = sum(1 for c in cells if isinstance(c, dict) and c.get("score", 0) > 0)
     except Exception:
         signed = "?"
@@ -2299,7 +2372,7 @@ def run_account(idx, acc, do_desktop):
     # 任务
     log("  ☁️ ── 云端任务 ──")
     t_accept_all(s, uid, nick, log)
-    t_sign(s, uid, nick, log)
+    summary["signed"] = t_sign(s, uid, nick, log)
     t_team_3(s, uid, nick, log)
     t_buddy_apps(s, uid, nick, log)
     t_theme(s, uid, nick, log)
@@ -2334,9 +2407,9 @@ def run_account(idx, acc, do_desktop):
             log("  🏫 开学季活动异常: %s" % str(e)[:80])
     # 领奖
     log("  🎁 ── 领奖 ──")
-    r = s.get(BASE + "/v2/activity/growth/tasks", timeout=25, verify=False).json()
+    r = get_json(s, BASE + "/v2/activity/growth/tasks", timeout=25) or {}
     n = 0
-    for t in r.get("data", {}).get("tasks", []):
+    for t in (r.get("data") or {}).get("tasks", []):
         if isinstance(t, dict) and t.get("accept_status") == "completed":
             claim(s, t.get("task_code", ""), log)
             n += 1
@@ -2344,10 +2417,10 @@ def run_account(idx, acc, do_desktop):
     if n == 0:
         log("   无待领奖励")
     # 终态
-    st_all = s.get(BASE + "/v2/activity/growth/tasks", timeout=25, verify=False).json().get("data", {}).get("tasks", [])
+    st_all = (get_json(s, BASE + "/v2/activity/growth/tasks", timeout=25) or {}).get("data", {}).get("tasks", [])
     done = sum(1 for t in st_all if isinstance(t, dict) and t.get("accept_status") in ("claimed", "completed"))
     rest = [task_cn(t.get("task_code","")) for t in st_all if isinstance(t, dict) and t.get("accept_status") not in ("claimed", "completed")]
-    prof2 = s.get(BASE + "/v2/activity/growth/profile", timeout=25, verify=False).json().get("data", {})
+    prof2 = (get_json(s, BASE + "/v2/activity/growth/profile", timeout=25) or {}).get("data", {})
     summary.update({"done": done, "total": len(st_all), "rest": rest,
                     "level": prof2.get("level", "?"), "energy": energy})
     log("🏁 %s: 完成%s/%s 等级%s 剩余: %s" % (acc.get("note", ""), done, len(st_all), prof2.get("level", "?"),
@@ -2385,6 +2458,10 @@ def build_summary(summaries):
         lines.append("   💰 %s" % (credits if credits else "暂无数据"))
         lines.append("   📊 %s" % (usage if usage else "暂无数据"))
         lines.append("   🌱 等级%s | 连签%s天 | 能量%s" % (level, streak, energy))
+        sign = sm.get("signed", "?")
+        sign_cn = {"claimed": "✅ 已领取", "already": "✅ 今日已签",
+                   "failed": "❌ 失败", "?": "❓ 未执行"}.get(sign, str(sign))
+        lines.append("   📅 签到: %s" % sign_cn)
         if rest_cn:
             lines.append("   ⏳ 未完成: %s" % "、".join(rest_cn))
         else:
@@ -2487,6 +2564,7 @@ def main():
         print("🖥️ 非Windows环境：桌面任务自动降级为指纹上报模式")
     all_msgs = []
     summaries = []
+    failed = []
     if SCHOOL_ONLY:
         do_desktop = False
         for i, acc in enumerate(ACCOUNTS):
@@ -2511,21 +2589,41 @@ def main():
         with ThreadPoolExecutor(max_workers=min(6, len(ACCOUNTS))) as ex:
             futs = {ex.submit(run_account, i + 1, acc, False): i for i, acc in enumerate(ACCOUNTS)}
             for f in as_completed(futs):
-                msgs_part, sm = f.result()
+                try:
+                    msgs_part, sm = f.result()
+                except Exception as e:
+                    print("❌ 账号%d 查询异常: %s: %s" % (futs[f] + 1, type(e).__name__, str(e)[:120]))
+                    continue
                 all_msgs.extend(msgs_part)
                 summaries.append(sm)
     else:
         # 云端任务并发，桌面任务串行
         for i, acc in enumerate(ACCOUNTS):
-            msgs_part, sm = run_account(i + 1, acc, do_desktop)
+            try:
+                msgs_part, sm = run_account(i + 1, acc, do_desktop)
+            except Exception as e:
+                # 单账号异常不再拖垮整个工作流：2026-10-23 起账号2 在查询阶段
+                # 崩溃（JSONDecodeError 未捕获），导致账号3/4 的签到全部被跳过、
+                # 工作流连续数日 red。这里记录后继续跑其余账号；失败的账号在
+                # 末尾以非零退出码如实呈现，不搞静默假成功。
+                print("❌ 账号%d 运行异常: %s: %s" % (i + 1, type(e).__name__, str(e)[:120]))
+                failed.append(i + 1)
+                summaries.append({"idx": i + 1, "note": acc.get("note", ""), "done": 0, "total": 0,
+                                  "rest": ["运行异常: " + type(e).__name__], "level": "?", "energy": "?",
+                                  "credits": "运行异常", "usage": "运行异常", "streak": "?", "signed": "?"})
+                time.sleep(2)
+                continue
             all_msgs.extend(msgs_part)
             summaries.append(sm)
             time.sleep(2)
+        if failed:
+            print("❌ 以下账号运行失败: %s（其余账号已跑完）" % ", ".join(map(str, failed)))
     # 推送摘要（完整日志见青龙日志/控制台）
     send_notify_all("🌱 WorkBuddy 签到报告", build_summary(summaries))
+    return 1 if failed else 0
 
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main() or 0)
