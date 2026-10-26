@@ -115,6 +115,20 @@ def safe_json(r, default=None):
         return default
 
 
+def _json_or_empty(r):
+    """容错取 JSON：非 JSON 响应（401/403 空体、网关 HTML 错误页）返回 {}，不抛异常。
+
+    与上游 L0NE-6/WorkBuddy-Daily 同款写法（对应其 issue #12/#13）：
+    AT/RT 失效时网关返回空 body 或 HTML，裸 .json() 会抛 JSONDecodeError
+    把整个运行炸掉。查询/领奖/互动类接口拿不到数据时降级成空 dict，
+    由各调用点按"取不到就当没数据"处理，绝不让工作流陪葬。
+    """
+    try:
+        d = r.json()
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
 def get_json(s, url, timeout=25, retries=3, default=None):
     """带重试的安全 GET：网络/5xx 由 api_retry 兜底，非 JSON 响应重试后返回 default。
 
@@ -215,7 +229,7 @@ def fetch_expert_marketplace():
         s.headers.update({"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
         r = s.get(EXPERT_MARKETPLACE_URL, timeout=15, verify=False)
         if r.status_code == 200:
-            _expert_cache = r.json()
+            _expert_cache = _json_or_empty(r)
             return _expert_cache
     except Exception:
         pass
@@ -327,21 +341,47 @@ def jwt_user(tok):
         return "?"
 
 
-def refresh_one(rt):
-    """刷新单个RT，返回 (新AT, 新RT) 或 (None, 错误信息)"""
+# 续期瞬时失败退避表：第 1 次重试等 5s，第 2 次等 15s。
+# 2026-10-24 运行里 3 个账号同时 ReadTimeout（copilot.tencent.com:443 偶发
+# 限流），旧代码只重试 1 次且间隔 3s，三个账号全灭 → AT 过期 → 后续 401。
+REFRESH_RETRY_SLEEP = (5, 15)
+
+
+def refresh_one(rt, retries=3):
+    """刷新单个RT，返回 (新AT, 新RT) 或 (None, 错误信息)
+
+    瞬时错误（连接超时/ReadTimeout/连接重置/网关 5xx 非 JSON 错误页）按
+    5s/15s 退避重试；确定性失败（401/403 鉴权失效、业务 code!=0）不重试，
+    直接返回服务端原因——重试一个已失效的 RT 只会白拖长工作流耗时。
+    """
     s = requests.Session(); s.trust_env = False
-    r = s.post(REFRESH_URL, json={}, timeout=20, verify=False,
-               headers={"X-Refresh-Token": rt, "X-Auth-Refresh-Source": "plugin",
-                        "Content-Type": "application/json"})
-    d = safe_json(r, None)
-    if not isinstance(d, dict):
-        # 网关错误页/空 body：旧代码在这里直接抛 JSONDecodeError，
-        # 被 auto_refresh 的 except 吞成"续期失败: err"，真实原因不可见
-        return None, "刷新接口返回非 JSON（HTTP %s）" % r.status_code
-    inner = d.get("data") or {}
-    if d.get("code") == 0 and inner.get("accessToken"):
-        return inner["accessToken"], inner.get("refreshToken") or rt
-    return None, (str(d.get("msg", ""))[:120] or ("HTTP %s" % r.status_code))
+    last = "未知错误"
+    for attempt in range(max(1, retries)):
+        try:
+            r = s.post(REFRESH_URL, json={}, timeout=25, verify=False,
+                       headers={"X-Refresh-Token": rt, "X-Auth-Refresh-Source": "plugin",
+                                "Content-Type": "application/json"})
+        except requests.exceptions.RequestException as e:
+            # 网络层瞬时错误：值得退避重试
+            last = "%s: %s" % (type(e).__name__, str(e)[:80])
+            if attempt < retries - 1:
+                time.sleep(REFRESH_RETRY_SLEEP[min(attempt, len(REFRESH_RETRY_SLEEP) - 1)])
+            continue
+        d = safe_json(r, None)
+        if not isinstance(d, dict):
+            # 网关错误页/空 body：旧代码在这里直接抛 JSONDecodeError，
+            # 被 auto_refresh 的 except 吞成"续期失败: err"，真实原因不可见
+            last = "刷新接口返回非 JSON（HTTP %s）" % r.status_code
+            # 5xx 是网关侧瞬时问题，可重试；401/403 是凭据问题，重试无意义
+            if r.status_code >= 500 and attempt < retries - 1:
+                time.sleep(REFRESH_RETRY_SLEEP[min(attempt, len(REFRESH_RETRY_SLEEP) - 1)])
+                continue
+            return None, last
+        inner = d.get("data") or {}
+        if d.get("code") == 0 and inner.get("accessToken"):
+            return inner["accessToken"], inner.get("refreshToken") or rt
+        return None, (str(d.get("msg", ""))[:120] or ("HTTP %s" % r.status_code))
+    return None, last
 
 
 def refresh_all(verbose=True):
@@ -407,6 +447,23 @@ def _rebuild_token_file(store):
         open(TOKEN_FILE, "w", encoding="utf-8").write("@".join(toks))
 
 
+def _at_expired(at, grace=600):
+    """AT 是否已过期（含 10 分钟宽限）。解析失败按未过期处理，交给服务端 401 判定。
+
+    过期 token 打任何接口都是 401 空体；旧代码仍然拿死 token 逐接口连打，
+    每个函数各自失败一次，最后汇报一排看不出根因的"失败"。
+    """
+    if not at:
+        return True
+    try:
+        pay = at.split(".")[1]
+        pay += "=" * (4 - len(pay) % 4)
+        exp = json.loads(base64.urlsafe_b64decode(pay)).get("exp", 0)
+        return bool(exp) and exp - grace <= time.time()
+    except Exception:
+        return False
+
+
 def auto_refresh():
     """启动前自动续期：距上次刷新超10天(或AT快过期)的账号自动刷新"""
     # 环境变量里的新RT合并进 store（支持随时用变量补充账号）
@@ -461,17 +518,13 @@ def auto_refresh():
     updated = {}
     for user, ent in due.items():
         at, nrt = None, None
-        # 瞬时网关错误（HTML 错误页/连接重置）重试一次；真实原因保留在 nrt 里，
+        # 瞬时网关错误（HTML 错误页/连接重置/ReadTimeout）的退避重试已内聚在
+        # refresh_one 里（5s/15s）；这里只兜住意料外的异常，且保留真实原因，
         # 不再像旧代码那样吞成 "err"——续期失败看不见原因，RT 过期后就只能人工重置
-        for attempt in (1, 2):
-            try:
-                at, nrt = refresh_one(ent.get("refresh_token", ""))
-            except Exception as e:
-                at, nrt = None, "%s: %s" % (type(e).__name__, str(e)[:60])
-            if at:
-                break
-            if attempt == 1:
-                time.sleep(3)
+        try:
+            at, nrt = refresh_one(ent.get("refresh_token", ""))
+        except Exception as e:
+            at, nrt = None, "%s: %s" % (type(e).__name__, str(e)[:60])
         if at:
             store[user] = {"refresh_token": nrt, "access_token": at,
                            "updated": time.strftime("%Y-%m-%d %H:%M")}
@@ -497,7 +550,7 @@ def load_accounts():
             if accs:
                 no_at = [a["note"] for a in accs if not a["access_token"]]
                 if no_at:
-                    print("⚠️ 以下账号无 AT（续期可能失败），仍会尝试执行: %s" % ", ".join(no_at))
+                    print("⚠️ 以下账号无 AT 且续期失败，将被跳过: %s" % ", ".join(no_at))
                 return accs
         except Exception:
             pass
@@ -512,7 +565,30 @@ def load_accounts():
     sys.exit(1)
 
 
-ACCOUNTS = load_accounts()
+def filter_live_accounts(accs):
+    """账号级预检：剔除 AT 已过期的账号（续期失败时尤为关键）。
+
+    过期 token 打任何接口都是 401 空体，逐个跑完只会得到一排看不出根因的
+    "失败"；这里直接跳过并说明原因，把时间留给还能跑的账号。
+    """
+    live, dead = [], []
+    for i, acc in enumerate(accs, 1):
+        tok = acc.get("access_token", "")
+        # 空 AT 同样算"死"：没有 Bearer 任何请求都是未认证，跑了也是全 401。
+        # （无 AT 时 auto_refresh 本就会尝试刷新；走到这里说明刷新已失败）
+        if _at_expired(tok):
+            dead.append((i, acc.get("note", "")))
+        else:
+            live.append(acc)
+    if dead:
+        print("⏭️ 跳过 AT 已过期的账号: %s" % ", ".join(
+            "账号%d(%s)" % (i, n or "?") for i, n in dead))
+        print("   原因：续期失败且 AT 已失效 —— 请重新登录桌面端获取新的 RT，"
+              "或用 WORKBUDDY_REFRESH_TOKEN 变量补充")
+    return live
+
+
+ACCOUNTS = filter_live_accounts(load_accounts())
 ONLY = int(sys.argv[sys.argv.index("--only") + 1]) - 1 if "--only" in sys.argv else None
 if ONLY is not None:
     ACCOUNTS = [ACCOUNTS[ONLY]]
@@ -594,7 +670,7 @@ def nickname_of(tok):
 
 def prog(s, code):
     try:
-        r = s.get(BASE + "/v2/activity/growth/tasks", timeout=25, verify=False).json()
+        r = _json_or_empty(s.get(BASE + "/v2/activity/growth/tasks", timeout=25, verify=False))
         for t in r.get("data", {}).get("tasks", []):
             if t.get("task_code") == code:
                 pr = t.get("progress") or {}
@@ -614,7 +690,7 @@ def claim(s, code, log):
                    headers={"Origin": BASE, "Referer": BASE + "/profile/growth-center",
                             "x-client-platform": "web"})
     try:
-        d = r.json().get("data", {})
+        d = _json_or_empty(r).get("data", {})
         log("   🎁领奖[%s]: %s" % (code, "已领过" if d.get("already_claimed") else "+%s积分+%s能量" % (d.get("credit"), d.get("energy"))))
     except Exception:
         log("   领奖[%s]: HTTP %s" % (code, r.status_code))
@@ -646,8 +722,9 @@ def report(s, uid, nick, events):
 
 
 def webchat(s, conv_name, prompt, meta=None, model="glm-5.2"):
-    conv = s.post(BASE + "/console/webchat/conversations", json={"name": conv_name + "-" + str(uuid.uuid4())[:8]},
-                  timeout=20, verify=False).json()
+    conv = _json_or_empty(s.post(BASE + "/console/webchat/conversations",
+                                 json={"name": conv_name + "-" + str(uuid.uuid4())[:8]},
+                                 timeout=20, verify=False))
     conv_id = conv.get("data", {}).get("conversationId", "")
     payload = {"messages": [{"role": "user", "content": prompt}], "model": model, "stream": True,
                "conversationId": conv_id}
@@ -701,7 +778,7 @@ def chat_request_events(uid, nick, conv_id, prompt, txt):
 def queryCredits(s):
     """积分查询：套餐总量/剩余/已用"""
     try:
-        r = s.post(BASE + "/billing/meter/get-user-resource-summary", json={}, timeout=20, verify=False).json()
+        r = _json_or_empty(s.post(BASE + "/billing/meter/get-user-resource-summary", json={}, timeout=20, verify=False))
         pkgs = r.get("data", {}).get("Packages", [])
         paid = r.get("data", {}).get("IsPaidUser")
         out = []
@@ -723,7 +800,7 @@ def queryCredits(s):
 def queryUsage(s):
     """用量查询：资源总数/总用量"""
     try:
-        r = s.post(BASE + "/billing/meter/get-user-resource", json={}, timeout=20, verify=False).json()
+        r = _json_or_empty(s.post(BASE + "/billing/meter/get-user-resource", json={}, timeout=20, verify=False))
         resp = r.get("data", {}).get("Response", {}).get("Data", {}) or {}
         return "共%d类资源，本月已使用%s次" % (resp.get("TotalCount", "?"), resp.get("TotalDosage", "?"))
     except Exception:
@@ -776,7 +853,7 @@ def t_accept_all(s, uid, nick, log):
     try:
         r2 = s.post(BASE + "/v2/activity/growth/tasks/accept",
                     json={"task_codes": todo}, timeout=20, verify=False)
-        d2 = r2.json()
+        d2 = _json_or_empty(r2)
         for x in ((d2.get("data") or {}).get("results") or []):
             if isinstance(x, dict) and x.get("task_code"):
                 resp[x["task_code"]] = (x.get("status") or "", (x.get("message") or "")[:50])
@@ -876,7 +953,7 @@ def t_theme(s, uid, nick, log):
         return
     r = s.post(BASE + "/portal/user-asset/appearance/set", json={"kind": "theme", "resource_key": THEME_KEY},
                timeout=20, verify=False)
-    if r.json().get("code") == 0:
+    if _json_or_empty(r).get("code") == 0:
         time.sleep(2)
         report(s, uid, nick, [{"eventCode": "appearance_skin_apply", "action": "apply",
                                "source": "settings_close", "id": THEME_KEY, "vipLevel": "free",
@@ -1025,7 +1102,7 @@ def t_glm52(s, uid, nick, log):
 def t_lottery(s, uid, nick, log):
     """抽奖：查剩余次数并全部抽完"""
     try:
-        r = s.get(BASE + "/v2/activity/growth/lottery/chances", timeout=20, verify=False).json()
+        r = _json_or_empty(s.get(BASE + "/v2/activity/growth/lottery/chances", timeout=20, verify=False))
         cd = r.get("data", {})
         chances = cd.get("balance", cd.get("chances", cd.get("remaining", 0)))
         if not chances or chances <= 0:
@@ -1035,8 +1112,8 @@ def t_lottery(s, uid, nick, log):
         for i in range(int(chances)):
             if i > 0:
                 time.sleep(2)
-            rr = s.post(BASE + "/v2/activity/growth/lottery/draw",
-                        json={"client_token": "draw-" + str(uuid.uuid4())}, timeout=20, verify=False).json()
+            rr = _json_or_empty(s.post(BASE + "/v2/activity/growth/lottery/draw",
+                                       json={"client_token": "draw-" + str(uuid.uuid4())}, timeout=20, verify=False))
             if rr.get("code") == 0:
                 prize = rr.get("data", {}).get("prize_name", rr.get("data", {}).get("name", "?"))
                 won.append(str(prize))
@@ -1051,7 +1128,7 @@ def t_lottery(s, uid, nick, log):
 def t_blindbox(s, uid, nick, log):
     """盲盒：能量足够就开（每次10能量，最多开5次）"""
     try:
-        q = s.get(BASE + "/v2/activity/growth/buddy/quota", timeout=20, verify=False).json()
+        q = _json_or_empty(s.get(BASE + "/v2/activity/growth/buddy/quota", timeout=20, verify=False))
         qd = q.get("data", {})
         affordable = qd.get("affordable", 0)
         if not affordable or affordable <= 0:
@@ -1060,7 +1137,7 @@ def t_blindbox(s, uid, nick, log):
         n = min(affordable, 5)
         got = []
         for _ in range(n):
-            rr = s.post(BASE + "/v2/activity/growth/buddy/open", json={"count": 1}, timeout=20, verify=False).json()
+            rr = _json_or_empty(s.post(BASE + "/v2/activity/growth/buddy/open", json={"count": 1}, timeout=20, verify=False))
             if rr.get("code") == 0:
                 results = rr.get("data", {}).get("results", [])
                 if results:
@@ -1078,7 +1155,7 @@ def t_blindbox(s, uid, nick, log):
 def t_buddy_info(s, uid, nick, log):
     """Buddy 信息"""
     try:
-        r = s.get(BASE + "/v2/activity/growth/buddy/info", timeout=20, verify=False).json()
+        r = _json_or_empty(s.get(BASE + "/v2/activity/growth/buddy/info", timeout=20, verify=False))
         if r.get("code") == 0:
             b = r.get("data", {}).get("buddy", r.get("data", {}))
             log("   🐱Buddy: %s (%s)%s" % (b.get("name", "?"), b.get("rarity", ""),
@@ -1090,20 +1167,20 @@ def t_buddy_info(s, uid, nick, log):
 def t_travel(s, uid, nick, log):
     """派猫猫旅行：到达领礼物 / 旅行中等待 / 空闲出发（幂等状态机）"""
     try:
-        vis = s.get(BASE + "/v2/activity/growth/buddy/visible", timeout=20, verify=False).json()
+        vis = _json_or_empty(s.get(BASE + "/v2/activity/growth/buddy/visible", timeout=20, verify=False))
         if vis.get("code") == 0:
             vd = vis.get("data", {})
             if not vd.get("buddy_visible", True) or not vd.get("has_buddy", True):
                 log("   🐾旅行: 无Buddy，跳过")
                 return
-        st = s.get(BASE + "/v2/activity/growth/buddy/travel/status", timeout=20, verify=False).json()
+        st = _json_or_empty(s.get(BASE + "/v2/activity/growth/buddy/travel/status", timeout=20, verify=False))
         if not (st.get("code") == 0):
             log("   🐾旅行: 状态获取失败")
             return
         sd = st.get("data", {})
         state = sd.get("state", "idle")
         if state == "arrived":
-            rr = s.post(BASE + "/v2/activity/growth/buddy/travel/claim", json={}, timeout=20, verify=False).json()
+            rr = _json_or_empty(s.post(BASE + "/v2/activity/growth/buddy/travel/claim", json={}, timeout=20, verify=False))
             if rr.get("code") == 0:
                 log("   🐾旅行: 🎉领取礼物 +%s积分" % rr.get("data", {}).get("reward_credit", 0))
             else:
@@ -1116,13 +1193,13 @@ def t_travel(s, uid, nick, log):
         if sd.get("daily_limit_reached"):
             log("   🐾旅行: 今日次数已用尽")
             return
-        cfg = s.get(BASE + "/v2/activity/growth/buddy/travel/config", timeout=20, verify=False).json()
+        cfg = _json_or_empty(s.get(BASE + "/v2/activity/growth/buddy/travel/config", timeout=20, verify=False))
         locs = cfg.get("data", {}).get("locations", [])
         if not locs:
             log("   🐾旅行: 无目的地")
             return
-        rr = s.post(BASE + "/v2/activity/growth/buddy/travel/depart",
-                    json={"location_id": locs[0].get("id")}, timeout=20, verify=False).json()
+        rr = _json_or_empty(s.post(BASE + "/v2/activity/growth/buddy/travel/depart",
+                                   json={"location_id": locs[0].get("id")}, timeout=20, verify=False))
         if rr.get("code") == 0:
             remain = max(0, (rr.get("data", {}).get("arrive_at", 0) - rr.get("data", {}).get("server_now", 0)) // 3600)
             log("   🐾旅行: ✅已出发，约%s小时后到达（下次运行自动领取）" % remain)
@@ -1138,9 +1215,9 @@ def t_redeem(s, uid, nick, log, streak_days=None):
     for tier, need, label in tiers:
         if streak_days is not None and streak_days < need:
             continue
-        rr = s.post(BASE + "/v2/activity/growth/redeem",
-                    json={"tier": tier, "client_token": "redeem-" + tier + "-" + str(uuid.uuid4())},
-                    timeout=20, verify=False).json()
+        rr = _json_or_empty(s.post(BASE + "/v2/activity/growth/redeem",
+                                   json={"tier": tier, "client_token": "redeem-" + tier + "-" + str(uuid.uuid4())},
+                                   timeout=20, verify=False))
         code = rr.get("code", -1)
         if code == 0:
             d = rr.get("data", {})
@@ -1153,7 +1230,7 @@ def t_redeem(s, uid, nick, log, streak_days=None):
 
 def t_badges(s, uid, nick, log):
     try:
-        r = s.get(BASE + "/v2/activity/growth/badges", timeout=20, verify=False).json()
+        r = _json_or_empty(s.get(BASE + "/v2/activity/growth/badges", timeout=20, verify=False))
         badges = r.get("data", {}).get("badges", r.get("data", {}).get("list", []))
         earned = sum(1 for b in badges if isinstance(b, dict) and b.get("earned"))
         log("   🏅徽章: %s个" % earned)
@@ -1348,7 +1425,7 @@ def cdp_ui_send(prompt):
     import websocket
     try:
         r = requests.get("http://127.0.0.1:9222/json", timeout=5, proxies={"http": None, "https": None})
-        pt = [x for x in r.json() if x.get("type") == "page"][0]
+        pt = [x for x in _json_or_empty(r) if x.get("type") == "page"][0]
         ws = websocket.create_connection(pt["webSocketDebuggerUrl"], timeout=10, suppress_origin=True)
         state = {"i": 0}
 
@@ -1406,7 +1483,7 @@ def t_desktop_tasks(s, uid, nick, tok, log, need_rich, need_skill):
         log("   🖥️ 桌面换血流程启动（结束后自动还原认证并重启桌面端）...")
         if need_skill:
             try:
-                src_ = s.get(BASE + "/console/as/marketplace/sources", timeout=20, verify=False).json()
+                src_ = _json_or_empty(s.get(BASE + "/console/as/marketplace/sources", timeout=20, verify=False))
                 srcs = (src_.get("data") or {}).get("sources") or []
                 mid = srcs[0].get("id") if srcs else None
                 if mid:
@@ -1481,7 +1558,7 @@ def _desktop_fingerprint_fallback(s, uid, nick, log, need_rich, need_skill):
     if need_skill:
         # 技能：先用 API 安装，再发 skill_info 事件
         try:
-            src_ = s.get(BASE + "/console/as/marketplace/sources", timeout=20, verify=False).json()
+            src_ = _json_or_empty(s.get(BASE + "/console/as/marketplace/sources", timeout=20, verify=False))
             srcs = (src_.get("data") or {}).get("sources") or []
             mid = srcs[0].get("id") if srcs else None
             if mid:
@@ -1494,7 +1571,7 @@ def _desktop_fingerprint_fallback(s, uid, nick, log, need_rich, need_skill):
             # 获取技能 ID
             skills_r = api_retry(s, "POST", SCHOOL_DOMAIN + "/v2/operation-platform/market/skill/list",
                                  body={"page": 1, "page_size": 10})
-            skills = (skills_r.json().get("data") or {}).get("skills") or []
+            skills = (_json_or_empty(skills_r).get("data") or {}).get("skills") or []
             skill_id = next((sk.get("id") for sk in skills if SKILL_NAME in str(sk.get("name", ""))), "")
             if not skill_id:
                 skill_id = "skill-" + derive_id(uid, "skill")[:12]
@@ -1520,13 +1597,13 @@ def _desktop_fingerprint_fallback(s, uid, nick, log, need_rich, need_skill):
 def t_gift_compensation(s, uid, nick, log):
     """礼包(每号一次) + 补偿领取(活动开启时)"""
     try:
-        r = s.post(BASE + "/billing/meter/claim-gift", json={}, timeout=15, verify=False).json()
+        r = _json_or_empty(s.post(BASE + "/billing/meter/claim-gift", json={}, timeout=15, verify=False))
         if r.get("code") == 0:
             log("   🎊新手礼包: +%s积分" % r.get("data", {}).get("credit", "?"))
     except Exception:
         pass
     try:
-        r = s.post(BASE + "/billing/meter/claim-compensation", json={}, timeout=15, verify=False).json()
+        r = _json_or_empty(s.post(BASE + "/billing/meter/claim-compensation", json={}, timeout=15, verify=False))
         if r.get("code") == 0:
             log("   🎊补偿领取: +%s积分" % r.get("data", {}).get("credit", "?"))
     except Exception:
@@ -1537,9 +1614,9 @@ def t_makeup(s, uid, nick, log):
     """补签卡：热力图检测昨日漏签则自动补签（保住连签）"""
     import datetime
     try:
-        hm = s.get(BASE + "/v2/activity/growth/heatmap", timeout=20, verify=False).json()
+        hm = _json_or_empty(s.get(BASE + "/v2/activity/growth/heatmap", timeout=20, verify=False))
         cells = hm.get("data", {}).get("cells", [])
-        bal = s.get(BASE + "/v2/activity/growth/streak", timeout=20, verify=False).json().get("data", {}).get("makeup_cards", {}).get("balance", 0)
+        bal = _json_or_empty(s.get(BASE + "/v2/activity/growth/streak", timeout=20, verify=False)).get("data", {}).get("makeup_cards", {}).get("balance", 0)
         yesterday = (beijing_today() - datetime.timedelta(days=1)).isoformat()
         missed = None
         for c in cells:
@@ -1548,8 +1625,8 @@ def t_makeup(s, uid, nick, log):
                 missed = yesterday
                 break
         if missed and bal > 0:
-            r = s.post(BASE + "/v2/activity/growth/makeup-cards/use", json={"target_date": missed},
-                       timeout=20, verify=False).json()
+            r = _json_or_empty(s.post(BASE + "/v2/activity/growth/makeup-cards/use", json={"target_date": missed},
+                                      timeout=20, verify=False))
             log("   🩹补签%s: %s" % (missed, "成功，连签保住" if r.get("code") == 0 else str(r.get("msg", ""))[:40]))
         elif missed:
             log("   🩹昨日(%s)漏签但无补签卡" % missed)
@@ -1570,7 +1647,7 @@ def t_first_buddy(s, uid, nick, log):
         s.post(BASE + "/v2/activity/growth/buddy/agreement", json={"agree": True},
                timeout=20, verify=False)
         time.sleep(WRITE_GAP)
-        r = s.post(BASE + "/v2/activity/growth/buddy/first", json={}, timeout=20, verify=False).json()
+        r = _json_or_empty(s.post(BASE + "/v2/activity/growth/buddy/first", json={}, timeout=20, verify=False))
         credit = (r.get("data") or {}).get("credit", 0)
         energy = (r.get("data") or {}).get("energy", 0)
         log("   🐱首只Buddy: %s (credit=+%s energy=+%s)" % (
@@ -1744,7 +1821,7 @@ def _mp_prog(s, code):
     """小程序口径查询任务（需 X-Client-Platform: miniprogram，否则任务不下发）。"""
     try:
         r = s.get(BASE + "/v2/activity/growth/tasks", timeout=25, verify=False, headers=MP_HEADER)
-        for t in r.json().get("data", {}).get("tasks", []):
+        for t in _json_or_empty(r).get("data", {}).get("tasks", []):
             if t.get("task_code") == code:
                 pr = t.get("progress") or {}
                 return t.get("accept_status", ""), pr.get("current"), pr.get("target")
@@ -1758,7 +1835,7 @@ def _mp_accept(s, code, log=None):
     try:
         r = s.post(BASE + "/v2/activity/growth/tasks/accept", json={"task_codes": [code]},
                    timeout=20, verify=False, headers=MP_HEADER)
-        d = r.json()
+        d = _json_or_empty(r)
         results = (d.get("data") or {}).get("results") or []
         status = (results[0].get("status") or "") if results else (d.get("msg") or "")
         msg = (results[0].get("message") or "")[:50] if results else ""
@@ -1777,7 +1854,7 @@ def _mp_claim(s, code, log):
     try:
         r = s.post(BASE + "/activity/growth/tasks/%s/claim" % code, json={},
                    timeout=20, verify=False, headers=MP_HEADER)
-        d = r.json().get("data", {})
+        d = _json_or_empty(r).get("data", {})
         log("   🎁领奖[%s]: %s" % (code, "已领过" if d.get("already_claimed")
                                    else "+%s积分+%s能量" % (d.get("credit"), d.get("energy"))))
         return r.status_code == 200
@@ -1852,7 +1929,7 @@ def t_unknown_tasks(s, uid, nick, log):
              "black_cat", "Expert_team_use_3", "first_buddy", "chat_5", "skill_1", "expert_5",
              "template_5", "automation_1", "workstation_expert",
              "Sequential_Tasks_1", "Sequential_Tasks_2", "school_season"}
-    r = s.get(BASE + "/v2/activity/growth/tasks", timeout=25, verify=False).json()
+    r = _json_or_empty(s.get(BASE + "/v2/activity/growth/tasks", timeout=25, verify=False))
     for t in r.get("data", {}).get("tasks", []):
         if not isinstance(t, dict):
             continue
@@ -1937,7 +2014,7 @@ def _school_fetch_expert(s):
             "categories": [SCHOOL_EXPERT_CATEGORY], "expert_type": "agent"}
     try:
         r = _school_post(s, SCHOOL_DOMAIN + "/v2/operation-platform/market/expert/list", body)
-        d = r.json()
+        d = _json_or_empty(r)
         experts = (d.get("data") or {}).get("experts") or []
         for e in experts:
             eid = e.get("expert_id")          # ← 正确字段名（不是 "id"）
@@ -1974,7 +2051,7 @@ def _school_expert_event(uid, nick, expert_id, expert_name, conv_id):
 
 def _school_fetch_tasks(s):
     r = _school_get(s, SCHOOL_BASE + "/tasks")
-    d = r.json()
+    d = _json_or_empty(r)
     if d.get("code") != 0:
         return [], False
     data = d.get("data") or {}
@@ -1983,17 +2060,17 @@ def _school_fetch_tasks(s):
 
 def _school_viewed(s, code):
     r = _school_post(s, SCHOOL_BASE + "/tasks/%s/viewed" % code)
-    return r.json().get("code") == 0
+    return _json_or_empty(r).get("code") == 0
 
 
 def _school_share_complete(s):
     r = _school_post(s, SCHOOL_BASE + "/tasks/share-complete", {"channel": "wechat"})
-    return r.json().get("code") == 0
+    return _json_or_empty(r).get("code") == 0
 
 
 def _school_claim(s, code):
     r = _school_post(s, SCHOOL_BASE + "/tasks/%s/claim" % code)
-    return r.json().get("code") == 0
+    return _json_or_empty(r).get("code") == 0
 
 
 def school_run_tasks(s, uid, nick, log):
@@ -2104,7 +2181,7 @@ def school_lottery(s, uid, nick, log):
     """开学季幸运大转盘：查余额 → 循环抽到 0。"""
     try:
         r = _school_get(s, SCHOOL_BASE + "/config")
-        d = r.json()
+        d = _json_or_empty(r)
         if d.get("code") != 0:
             log("  🏫 lottery config 失败")
             return
@@ -2120,7 +2197,7 @@ def school_lottery(s, uid, nick, log):
             draw_uuid = str(uuid.uuid4())
             try:
                 r2 = _school_post(s, SCHOOL_BASE + "/wheel/draw", {"draw_uuid": draw_uuid})
-                d2 = r2.json()
+                d2 = _json_or_empty(r2)
                 if d2.get("code") == 40900:
                     log("  🏫 lottery 次数耗尽")
                     break
@@ -2299,7 +2376,7 @@ def _accept_with_verify(s, code, log):
                    timeout=20, verify=False)
         status = ""
         try:
-            d = r.json()
+            d = _json_or_empty(r)
             results = (d.get("data") or {}).get("results") or []
             status = (results[0].get("status") or "") if results else (d.get("msg") or "")
         except Exception:
@@ -2498,7 +2575,7 @@ def _bark_notify(title, content):
         s = requests.Session(); s.trust_env = False
         r = s.post(url, json={"title": title, "body": content, "group": "WorkBuddy"},
                    timeout=20, verify=False)
-        d = r.json()
+        d = _json_or_empty(r)
         if d.get("code") == 200:
             print("📢 Bark 推送成功")
             return True
@@ -2521,7 +2598,7 @@ def send_notify(title, content):
         r = s.post("https://www.pushplus.plus/send",
                    json={"token": token, "title": title, "content": content, "template": "txt"},
                    timeout=20, verify=False)
-        d = r.json()
+        d = _json_or_empty(r)
         if d.get("code") == 200:
             print("📢 推送成功")
             return True
