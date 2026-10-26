@@ -34,6 +34,12 @@ jobs:
       - name: Install deps
         run: pip install requests
 
+      # 回归测试：2026-10-23 起因裸 .json() 撞上网关非 JSON 响应导致工作流连续 red。
+      # 改动脚本后先跑测试，防止再次把「非 JSON 会炸掉整个运行」这类回归带上去。
+      # 测试全部用假响应，不碰网络、不需要任何凭据。
+      - name: Regression tests
+        run: python tests/test_signin_hardening.py
+
       - name: Run WorkBuddy
         env:
           WORKBUDDY_REFRESH_TOKEN: ${{ secrets.WORKBUDDY_REFRESH_TOKEN }}
@@ -41,11 +47,18 @@ jobs:
           BARK_URL: ${{ secrets.BARK_URL }}
         run: python workbuddy_daily.py
 
-      # ⚠️ 仅在【私有仓库】中持久化令牌状态；公开仓库会跳过，避免 RT 泄露
+      # ⚠️ 仅在【私有仓库】中持久化令牌状态；公开仓库会跳过，避免 RT 泄露。
+      # 注意：本步骤历史上的 `git add -f wb_refresh_tokens.json` 正是把明文 RT
+      # 提交进公开仓库的根因（.gitignore 对已追踪文件无效）。现已双重防护：
+      # 外层 if 只在 private 仓库执行，内层再显式拒绝 public 仓库。
       - name: Persist token state (private repo only)
         # hardened-by-deployer:persist: 推送被拒时自动同步远端并重试，避免"已轮换的令牌丢失"
         if: always() && github.event.repository.private == true
         run: |
+          if [ "${{ github.event.repository.private }}" != "true" ]; then
+            echo "⛔ 仓库为公开可见，跳过令牌持久化（明文 RT 绝不进公开仓库）"
+            exit 0
+          fi
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -f wb_refresh_tokens.json 2>/dev/null || true
