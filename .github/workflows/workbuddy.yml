@@ -14,6 +14,10 @@ concurrency:
   group: workbuddy
   cancel-in-progress: false
 
+env:
+  # 私有令牌持久化仓库：存明文 RT，必须保持 Private
+  TOKEN_REPO: totootao/wb-tokens
+
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -24,7 +28,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0   # hardened-by-deployer:checkout: 回写令牌状态时需要完整历史来合并
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -34,11 +38,27 @@ jobs:
       - name: Install deps
         run: pip install requests
 
-      # 回归测试：2026-10-23 起因裸 .json() 撞上网关非 JSON 响应导致工作流连续 red。
-      # 改动脚本后先跑测试，防止再次把「非 JSON 会炸掉整个运行」这类回归带上去。
-      # 测试全部用假响应，不碰网络、不需要任何凭据。
+      # 回归测试：2026-10-23 起工作流连续 red 的根因是裸 .json() 撞上网关非 JSON
+      # 响应。改动脚本后先跑测试，防止同类回归再上去。测试全用假响应，不碰网络。
       - name: Regression tests
         run: python tests/test_signin_hardening.py
+
+      # 从私有令牌仓库拉最新令牌状态（含上次运行轮换出的新 RT）。
+      # 拉不到（首次运行/仓库被删）也不影响：脚本会从 WORKBUDDY_REFRESH_TOKEN 自举。
+      - name: Load token state (private repo)
+        env:
+          WB_TOKEN_REPO_PAT: ${{ secrets.WB_TOKEN_REPO_PAT }}
+        run: |
+          code=$(curl -sS -o wb_refresh_tokens.json -w "%{http_code}" \
+            -H "Authorization: token $WB_TOKEN_REPO_PAT" \
+            -H "Accept: application/vnd.github.raw" \
+            "https://api.github.com/repos/$TOKEN_REPO/contents/wb_refresh_tokens.json?ref=main")
+          if [ "$code" = "200" ] && [ -s wb_refresh_tokens.json ]; then
+            echo "✅ 已从 $TOKEN_REPO 载入令牌状态"
+          else
+            echo "⚠️ 令牌仓库无有效令牌文件（HTTP $code），将从 Secret 自举"
+            rm -f wb_refresh_tokens.json
+          fi
 
       - name: Run WorkBuddy
         env:
@@ -47,35 +67,42 @@ jobs:
           BARK_URL: ${{ secrets.BARK_URL }}
         run: python workbuddy_daily.py
 
-      # ⚠️ 仅在【私有仓库】中持久化令牌状态；公开仓库会跳过，避免 RT 泄露。
-      # 注意：本步骤历史上的 `git add -f wb_refresh_tokens.json` 正是把明文 RT
-      # 提交进公开仓库的根因（.gitignore 对已追踪文件无效）。现已双重防护：
-      # 外层 if 只在 private 仓库执行，内层再显式拒绝 public 仓库。
-      - name: Persist token state (private repo only)
-        # hardened-by-deployer:persist: 推送被拒时自动同步远端并重试，避免"已轮换的令牌丢失"
-        if: always() && github.event.repository.private == true
+      # 运行后把轮换出的最新令牌写回私有仓库持久化。
+      # ⚠️ 本仓库(vvvvrrrr)是公开的，明文 RT 绝不写到这里；只写 TOKEN_REPO。
+      # 推送失败时自动刷新文件 sha 重试（处理并发提交），失败不吞——Secret 兜底仍在。
+      - name: Persist token state (private repo)
+        if: always()
+        env:
+          WB_TOKEN_REPO_PAT: ${{ secrets.WB_TOKEN_REPO_PAT }}
         run: |
-          if [ "${{ github.event.repository.private }}" != "true" ]; then
-            echo "⛔ 仓库为公开可见，跳过令牌持久化（明文 RT 绝不进公开仓库）"
+          if [ ! -s wb_refresh_tokens.json ]; then
+            echo "无令牌文件，跳过持久化"
             exit 0
           fi
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -f wb_refresh_tokens.json 2>/dev/null || true
-          if git diff --cached --quiet; then
-            echo "令牌状态无变化"
-            exit 0
-          fi
-          git commit -m "chore: 更新令牌状态 [skip ci]"
+          api() { curl -sS -H "Authorization: token $WB_TOKEN_REPO_PAT" \
+                       -H "Accept: application/vnd.github+json" "$@"; }
+          msg="chore: 更新令牌状态 [skip ci]"
           for i in 1 2 3 4 5; do
-            if git push; then
-              echo "✅ 令牌状态已推送"
+            sha=$(api "https://api.github.com/repos/$TOKEN_REPO/contents/wb_refresh_tokens.json?ref=main" \
+                  | jq -r '.sha // empty')
+            if [ -n "$sha" ]; then
+              jq -n --arg m "$msg" --arg s "$sha" --rawfile c wb_refresh_tokens.json \
+                 '{message:$m, sha:$s, content:($c|@base64)}' > body.json
+            else
+              jq -n --arg m "$msg" --rawfile c wb_refresh_tokens.json \
+                 '{message:$m, content:($c|@base64)}' > body.json
+            fi
+            code=$(curl -sS -o resp.json -w "%{http_code}" -X PUT \
+              -H "Authorization: token $WB_TOKEN_REPO_PAT" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$TOKEN_REPO/contents/wb_refresh_tokens.json" \
+              --data @body.json)
+            if [ "$code" = "200" ] || [ "$code" = "201" ]; then
+              echo "✅ 令牌状态已持久化到 $TOKEN_REPO"
               exit 0
             fi
-            echo "第 $i 次推送被拒，同步远端后重试..."
-            git fetch --unshallow origin main 2>/dev/null || git fetch origin main
-            git merge -X ours --no-edit -m "chore: 合并远端令牌状态 [skip ci]" origin/main || true
+            echo "第 $i 次持久化失败 (HTTP $code): $(head -c 200 resp.json)"
             sleep 5
           done
-          echo "::error::令牌状态推送失败 —— 本次轮换的 refreshToken 未持久化，请检查分支保护规则，或本地执行 deploy.py --force-secret 重置"
+          echo "::error::令牌状态持久化失败 —— Secret 兜底仍在，但本轮轮换的新 RT 未落库"
           exit 1
